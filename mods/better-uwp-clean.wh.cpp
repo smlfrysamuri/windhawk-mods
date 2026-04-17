@@ -1,122 +1,161 @@
 // ==WindhawkMod==
-// @id                better-uwp-clean
-// @name            Clean Up UWP Processes (Improved)
-// @description    Automatically end UWP processes when no UWP apps are open, except for shell-critical processes.
-// @version         0.1
+// @id              better-uwp-clean
+// @name            (Better) UWP Clean
+// @description     Automatically end UWP processes when no UWP apps are open, except for shell-critical processes.
+// @version         0.4
 // @author          Smlfrysamuri
 // @github          https://github.com/smlfrysamuri
 // @include         ApplicationFrameHost.exe
 // @include         TextInputHost.exe
 // @include         SystemSettingsAdminFlows.exe
 // @include         ctfmon.exe
-// @compilerOptions -lcomdlg32
+// @compilerOptions -ldwmapi
 // ==/WindhawkMod==
 
 // ==WindhawkModReadme==
 /*
 # (Better) UWP Clean
-This is a slightly modified version of the UWP Clean mod created by https://github.com/arukateru. Whereas the
-original mod operated in such a way that caused RuntimeBroker.exe to exit, this mod still disables UWP processes
-without killing RuntimeBroker. This preserves shell-critical processes that use UWP, most importantly, the ability to 
-right-click taskbar menu buttons and access their context menus, which relies on RuntimeBroker.
+
+Automatically terminates non-essential UWP host processes
+(ApplicationFrameHost, TextInputHost, SystemSettingsAdminFlows, ctfmon)
+when **no** UWP app has a visible window open.
+
+Detection uses window enumeration with cloak-awareness rather than a
+hardcoded process-name list, so it works correctly with Calculator,
+Photos, Clock, Paint, and every other UWP app.
+
+A grace period at startup ensures the host process is not killed before
+the launching app has time to create its window.  The monitor also
+requires several consecutive idle checks before terminating, avoiding
+false positives during brief transitions between UWP apps.
+
+Shell-critical processes like RuntimeBroker.exe are never targeted.
 */
 // ==/WindhawkModReadme==
 
-#include <Windows.h>
-#include <string>
+#include <atomic>
 #include <thread>
-#include <TlHelp32.h>
+#include <windows.h>
+#include <dwmapi.h>
 
-bool IsProcessRunning(const std::wstring& processName) {
-    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (hSnap == INVALID_HANDLE_VALUE) return false;
+// --- Tuning constants ---
+// How long to wait after init before the first check (ms).
+// Gives the launching UWP app time to create its window.
+static constexpr DWORD STARTUP_GRACE_MS = 10000;
 
-    PROCESSENTRY32W pe32;
-    pe32.dwSize = sizeof(PROCESSENTRY32W);
-    if (!Process32FirstW(hSnap, &pe32)) {
-        CloseHandle(hSnap);
-        return false;
-    }
+// Interval between checks during monitoring (ms).
+static constexpr DWORD POLL_INTERVAL_MS = 5000;
 
-    do {
-        if (processName == pe32.szExeFile) {
-            CloseHandle(hSnap);
-            return true;
-        }
-    } while (Process32NextW(hSnap, &pe32));
+// How many consecutive "no windows" checks before we terminate.
+// Prevents killing the host during brief gaps (app switching, etc.).
+static constexpr int IDLE_THRESHOLD = 3;
 
-    CloseHandle(hSnap);
-    return false;
+// --- Globals ---
+static std::atomic<bool> g_stopThread{false};
+static std::thread g_workerThread;
+
+// ---------------------------------------------------------------
+// Window detection
+// ---------------------------------------------------------------
+
+static bool IsWindowCloaked(HWND hwnd) {
+    DWORD cloaked = 0;
+    return SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED,
+                                           &cloaked, sizeof(cloaked)))
+           && cloaked != 0;
 }
 
-// Terminate a specific process by name instead of the current host process
-void TerminateProcessByName(const std::wstring& processName) {
-    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (hSnap == INVALID_HANDLE_VALUE) return;
+struct EnumCtx {
+    bool found = false;
+};
 
-    PROCESSENTRY32W pe32;
-    pe32.dwSize = sizeof(PROCESSENTRY32W);
-    if (!Process32FirstW(hSnap, &pe32)) {
-        CloseHandle(hSnap);
+static BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam) {
+    auto* ctx = reinterpret_cast<EnumCtx*>(lParam);
+
+    wchar_t className[256]{};
+    if (!GetClassNameW(hwnd, className, _countof(className)))
+        return TRUE;
+
+    if (wcscmp(className, L"ApplicationFrameWindow") != 0)
+        return TRUE;
+
+    if (!IsWindowVisible(hwnd) || IsWindowCloaked(hwnd))
+        return TRUE;
+
+    if (GetWindowTextLengthW(hwnd) == 0)
+        return TRUE;
+
+    ctx->found = true;
+    return FALSE;
+}
+
+static bool AnyUwpAppWindowOpen() {
+    EnumCtx ctx;
+    EnumWindows(EnumWindowsProc, reinterpret_cast<LPARAM>(&ctx));
+    return ctx.found;
+}
+
+// ---------------------------------------------------------------
+// Interruptible sleep — returns true if stop was requested
+// ---------------------------------------------------------------
+static bool SleepInterruptible(DWORD totalMs) {
+    constexpr DWORD STEP = 500;
+    for (DWORD elapsed = 0;
+         elapsed < totalMs && !g_stopThread.load(std::memory_order_relaxed);
+         elapsed += STEP) {
+        Sleep(STEP);
+    }
+    return g_stopThread.load(std::memory_order_relaxed);
+}
+
+// ---------------------------------------------------------------
+// Background monitor thread
+// ---------------------------------------------------------------
+static void MonitorAndTerminate() {
+    // Startup grace period — let the UWP app create its window
+    if (SleepInterruptible(STARTUP_GRACE_MS))
         return;
-    }
 
-    do {
-        if (processName == pe32.szExeFile) {
-            HANDLE hProc = OpenProcess(PROCESS_TERMINATE, FALSE, pe32.th32ProcessID);
-            if (hProc) {
-                TerminateProcess(hProc, 0);
-                CloseHandle(hProc);
-            }
-        }
-    } while (Process32NextW(hSnap, &pe32));
+    int idleCount = 0;
 
-    CloseHandle(hSnap);
-}
+    while (!g_stopThread.load(std::memory_order_relaxed)) {
+        if (AnyUwpAppWindowOpen()) {
+            idleCount = 0;  // reset whenever we see a live window
+        } else {
+            ++idleCount;
+            Wh_Log(L"No visible UWP windows (%d/%d)", idleCount, IDLE_THRESHOLD);
 
-// Get the name of the current process
-std::wstring GetCurrentProcessName() {
-    wchar_t path[MAX_PATH];
-    GetModuleFileNameW(NULL, path, MAX_PATH);
-    std::wstring fullPath(path);
-    size_t pos = fullPath.rfind(L'\\');
-    return (pos != std::wstring::npos) ? fullPath.substr(pos + 1) : fullPath;
-}
-
-void CheckProcesses() {
-    std::wstring currentProc = GetCurrentProcessName();
-
-    while (true) {
-        std::this_thread::sleep_for(std::chrono::seconds(15));
-
-        bool systemSettingsRunning = IsProcessRunning(L"SystemSettings.exe");
-        bool wduiRunning           = IsProcessRunning(L"SecHealthUI.exe");
-        bool storeRunning          = IsProcessRunning(L"WinStore.App.exe");
-
-        if (!systemSettingsRunning && !wduiRunning && !storeRunning) {
-            // Only self-terminate safe, non-shell-critical processes.
-            // Never terminate RuntimeBroker.exe — it backs taskbar context menus.
-            if (currentProc == L"ApplicationFrameHost.exe" ||
-                currentProc == L"TextInputHost.exe"        ||
-                currentProc == L"SystemSettingsAdminFlows.exe" ||
-                currentProc == L"ctfmon.exe") {
+            if (idleCount >= IDLE_THRESHOLD) {
+                Wh_Log(L"Idle threshold reached — terminating host process");
                 ExitProcess(0);
             }
-            // For any other included process, do nothing (safe fallback)
         }
+
+        if (SleepInterruptible(POLL_INTERVAL_MS))
+            return;
     }
 }
 
-BOOL APIENTRY DllMain(HMODULE hModule,
-    DWORD  ul_reason_for_call,
-    LPVOID lpReserved
-) {
-    switch (ul_reason_for_call) {
-    case DLL_PROCESS_ATTACH:
-        std::thread(CheckProcesses).detach();
-        break;
-    default:
-        break;
-    }
+// ---------------------------------------------------------------
+// Windhawk lifecycle
+// ---------------------------------------------------------------
+
+BOOL Wh_ModInit() {
+    Wh_Log(L"better-uwp-clean: Initializing");
+
+    // Never terminate immediately — always defer to the monitor thread
+    // so the launching app has time to create its window.
+    g_stopThread.store(false, std::memory_order_relaxed);
+    g_workerThread = std::thread(MonitorAndTerminate);
+
     return TRUE;
+}
+
+void Wh_ModUninit() {
+    Wh_Log(L"better-uwp-clean: Uninitializing");
+
+    g_stopThread.store(true, std::memory_order_relaxed);
+    if (g_workerThread.joinable()) {
+        g_workerThread.join();
+    }
 }
